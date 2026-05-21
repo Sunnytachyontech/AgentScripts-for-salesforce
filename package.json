@@ -1,0 +1,25 @@
+{
+  "name": "citr-v9-project",
+  "version": "1.0.0",
+  "description": "This is a companion repository for the [Complete Intro to React, v9][fem] course on Frontend Masters.\r [![Frontend Masters](https://static.frontendmasters.com/assets/brand/logos/full.png)][fem]",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/btholt/citr-v9-project.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/btholt/citr-v9-project/issues"
+  },
+  "homepage": "https://github.com/btholt/citr-v9-project#readme",
+  "dependencies": {
+    "fastify": "^5.8.5",
+    "vite": "^8.0.13"
+  }
+}

@@ -287,6 +287,304 @@ server.get("/api/past-order/:order_id", async function getPastOrder(req, res) {
   }
 });
 
+// ============================================================
+// Agentforce Agent API Proxy Routes
+// ============================================================
+const SF_MY_DOMAIN_URL = process.env.SF_MY_DOMAIN_URL;
+const SF_CONSUMER_KEY = process.env.SF_CONSUMER_KEY;
+const SF_CONSUMER_SECRET = process.env.SF_CONSUMER_SECRET;
+const SF_AGENT_ID = process.env.SF_AGENT_ID;
+
+const SF_AGENT_API_BASE = "https://api.salesforce.com";
+
+// In-memory token cache
+let sfTokenCache = { token: null, expiresAt: 0 };
+
+async function getSalesforceToken() {
+  if (sfTokenCache.token && Date.now() < sfTokenCache.expiresAt - 60000) {
+    return sfTokenCache.token;
+  }
+
+  const tokenUrl = `${SF_MY_DOMAIN_URL}/services/oauth2/token`;
+  const params = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: SF_CONSUMER_KEY,
+    client_secret: SF_CONSUMER_SECRET,
+  });
+
+  const response = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`Token request failed (${response.status}): ${errBody}`);
+  }
+
+  const data = await response.json();
+  sfTokenCache = {
+    token: data.access_token,
+    expiresAt: (parseInt(data.issued_at, 10) || Date.now()) + 7200000,
+  };
+
+  return sfTokenCache.token;
+}
+
+// POST /api/agent/session
+server.post("/api/agent/session", async function startAgentSession(req, res) {
+  try {
+    if (!SF_MY_DOMAIN_URL || !SF_CONSUMER_KEY || !SF_CONSUMER_SECRET || !SF_AGENT_ID) {
+      return res.status(500).send({
+        error: "Salesforce Agent API is not configured.",
+      });
+    }
+
+    const token = await getSalesforceToken();
+    const sessionKey = crypto.randomUUID();
+
+    const agentUrl = `${SF_AGENT_API_BASE}/einstein/ai-agent/v1/agents/${SF_AGENT_ID}/sessions`;
+
+    const response = await fetch(agentUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "x-session-key": sessionKey,
+      },
+      body: JSON.stringify({
+        externalSessionKey: sessionKey,
+        instanceConfig: {
+          endpoint: SF_MY_DOMAIN_URL,
+        },
+        streamingCapabilities: {
+          chunkTypes: ["Text"],
+        },
+        bypassUser: true,
+      }),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      req.log.error(`Agent session start failed: ${errBody}`);
+      return res.status(response.status).send({
+        error: "Failed to start agent session",
+        details: errBody,
+      });
+    }
+
+    const data = await response.json();
+    res.send({
+      sessionId: data.sessionId,
+      externalSessionKey: sessionKey,
+    });
+  } catch (error) {
+    req.log.error(error);
+    res.status(500).send({ error: "Failed to start agent session" });
+  }
+});
+
+// POST /api/agent/message
+server.post("/api/agent/message", async function sendAgentMessage(req, res) {
+  try {
+    const { sessionId, message, sequenceId } = req.body;
+
+    if (!sessionId || !message) {
+      return res.status(400).send({ error: "sessionId and message are required" });
+    }
+
+    const token = await getSalesforceToken();
+    const msgUrl = `${SF_AGENT_API_BASE}/einstein/ai-agent/v1/sessions/${sessionId}/messages`;
+
+    const response = await fetch(msgUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        message: {
+          sequenceId: sequenceId || 1,
+          type: "Text",
+          text: message,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      req.log.error(`Agent message failed: ${errBody}`);
+      return res.status(response.status).send({
+        error: "Failed to send message to agent",
+        details: errBody,
+      });
+    }
+
+    const data = await response.json();
+
+    let agentReply = "";
+    if (data.messages && Array.isArray(data.messages)) {
+      for (const msg of data.messages) {
+        if (msg.type === "Inform" && msg.message) {
+          agentReply += msg.message;
+        } else if (msg.type === "Text" && msg.text) {
+          agentReply += msg.text;
+        }
+      }
+    }
+
+    res.send({
+      reply: agentReply || "The agent did not return a response.",
+      raw: data,
+    });
+  } catch (error) {
+    req.log.error(error);
+    res.status(500).send({ error: "Failed to send message to agent" });
+  }
+});
+
+// POST /api/agent/message/stream
+server.post("/api/agent/message/stream", async function streamAgentMessage(req, res) {
+  try {
+    const { sessionId, message, sequenceId } = req.body;
+
+    if (!sessionId || !message) {
+      return res.status(400).send({ error: "sessionId and message are required" });
+    }
+
+    const token = await getSalesforceToken();
+    const msgUrl = `${SF_AGENT_API_BASE}/einstein/ai-agent/v1/sessions/${sessionId}/messages/stream`;
+
+    const response = await fetch(msgUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify({
+        message: {
+          sequenceId: sequenceId || 1,
+          type: "Text",
+          text: message,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      req.log.error(`Agent stream failed: ${errBody}`);
+      return res.status(response.status).send({
+        error: "Failed to stream message from agent",
+        details: errBody,
+      });
+    }
+
+    res.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.raw.write(decoder.decode(value, { stream: true }));
+      }
+    } catch (streamErr) {
+      req.log.error("Stream reading error:", streamErr);
+    } finally {
+      res.raw.end();
+    }
+  } catch (error) {
+    req.log.error(error);
+    res.status(500).send({ error: "Failed to stream agent message" });
+  }
+});
+
+// POST /api/agent/end
+server.post("/api/agent/end", async function endAgentSession(req, res) {
+  try {
+    const { sessionId } = req.body;
+
+    if (!sessionId) {
+      return res.status(400).send({ error: "sessionId is required" });
+    }
+
+    const token = await getSalesforceToken();
+    const endUrl = `${SF_AGENT_API_BASE}/einstein/ai-agent/v1/sessions/${sessionId}`;
+
+    const response = await fetch(endUrl, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "x-session-key": sessionId,
+      },
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      req.log.error(`Agent session end failed: ${errBody}`);
+      return res.status(response.status).send({
+        error: "Failed to end agent session",
+        details: errBody,
+      });
+    }
+
+    res.send({ success: true });
+  } catch (error) {
+    req.log.error(error);
+    res.status(500).send({ error: "Failed to end agent session" });
+  }
+});
+
+// POST /api/agent/feedback
+server.post("/api/agent/feedback", async function submitAgentFeedback(req, res) {
+  try {
+    const { sessionId, feedbackType, feedbackText } = req.body;
+
+    if (!sessionId || !feedbackType) {
+      return res.status(400).send({ error: "sessionId and feedbackType are required" });
+    }
+
+    const token = await getSalesforceToken();
+    const feedbackUrl = `${SF_AGENT_API_BASE}/einstein/ai-agent/v1/sessions/${sessionId}/feedback`;
+
+    const response = await fetch(feedbackUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        feedbackType,
+        feedbackText: feedbackText || "",
+      }),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      req.log.error(`Agent feedback failed: ${errBody}`);
+      return res.status(response.status).send({
+        error: "Failed to submit feedback",
+        details: errBody,
+      });
+    }
+
+    res.status(201).send({ success: true });
+  } catch (error) {
+    req.log.error(error);
+    res.status(500).send({ error: "Failed to submit feedback" });
+  }
+});
+
 server.post("/api/contact", async function contactForm(req, res) {
   const { name, email, message } = req.body;
 
